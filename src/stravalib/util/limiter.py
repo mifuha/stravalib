@@ -98,14 +98,14 @@ def _get_applicable_rates(
 ) -> list[RequestRate]:
     """Keep applicable quota families separate, including their limits."""
     headers = {key.casefold(): value for key, value in headers.items()}
-    rates = []
-    overall = get_rates_from_response_headers(headers, "POST")
-    if overall is not None:
-        rates.append(overall)
+    methods: list[RequestMethod] = ["POST"]
     if non_upload and "x-readratelimit-usage" in headers:
-        read = get_rates_from_response_headers(headers, "GET")
-        if read is not None:
-            rates.append(read)
+        methods.append("GET")
+    rates = []
+    for method in methods:
+        rate = get_rates_from_response_headers(headers, method)
+        if rate is not None:
+            rates.append(rate)
     return rates
 
 
