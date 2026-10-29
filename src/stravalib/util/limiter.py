@@ -93,6 +93,22 @@ def get_rates_from_response_headers(
         return None
 
 
+def _get_applicable_rates(
+    headers: dict[str, str], non_upload: bool
+) -> list[RequestRate]:
+    """Keep applicable quota families separate, including their limits."""
+    headers = {key.casefold(): value for key, value in headers.items()}
+    rates = []
+    overall = get_rates_from_response_headers(headers, "POST")
+    if overall is not None:
+        rates.append(overall)
+    if non_upload and "x-readratelimit-usage" in headers:
+        read = get_rates_from_response_headers(headers, "GET")
+        if read is not None:
+            rates.append(read)
+    return rates
+
+
 def get_seconds_until_next_quarter(
     now: arrow.arrow.Arrow | None = None,
 ) -> int:
@@ -218,16 +234,39 @@ class SleepingRateLimitRule:
     def __call__(
         self, response_headers: dict[str, str], method: RequestMethod
     ) -> None:
-        """Determines wait time until a call can be made again"""
-        rates = get_rates_from_response_headers(response_headers, method)
+        """Throttle without endpoint context, retaining method-based scope.
+
+        GET responses account for both quotas. Other methods retain their
+        overall-only scope because the upload exemptions need a URL.
+        """
+        self._sleep_for_rates(
+            _get_applicable_rates(response_headers, non_upload=method == "GET")
+        )
+
+    def _on_response(
+        self,
+        response_headers: dict[str, str],
+        method: RequestMethod,
+        non_upload: bool,
+    ) -> None:
+        """Use endpoint context without bypassing custom __call__ overrides."""
+        if type(self).__call__ is not SleepingRateLimitRule.__call__:
+            self(response_headers, method)
+            return
+        self._sleep_for_rates(
+            _get_applicable_rates(response_headers, non_upload)
+        )
+
+    def _sleep_for_rates(self, rates: list[RequestRate]) -> None:
         self.log.debug(f"Throttling based on rates: {rates}")
 
         if rates:
+            short_reset = get_seconds_until_next_quarter()
+            long_reset = get_seconds_until_next_day()
             time.sleep(
-                self._get_wait_time(
-                    rates,
-                    get_seconds_until_next_quarter(),
-                    get_seconds_until_next_day(),
+                max(
+                    self._get_wait_time(rate, short_reset, long_reset)
+                    for rate in rates
                 )
             )
         else:
@@ -245,6 +284,36 @@ class RateLimiter:
         """Register another request is being issued."""
         for r in self.rules:
             r(args, method)
+
+    def _on_response(
+        self, args: dict[str, str], method: RequestMethod, non_upload: bool
+    ) -> None:
+        """Pass request context to built-in rules, preserving custom calls."""
+        if type(self).__call__ is not RateLimiter.__call__:
+            self(args, method)
+            return
+        for rule in self.rules:
+            _apply_rate_limiter(rule, args, method, non_upload=non_upload)
+
+
+def _apply_rate_limiter(
+    callback: Callable[[dict[str, str], RequestMethod], None],
+    headers: dict[str, str],
+    method: RequestMethod,
+    *,
+    non_upload: bool,
+) -> None:
+    """Give built-in limiters request scope without changing custom callbacks."""
+    # Use the built-in methods so an unrelated private method on a custom
+    # callback cannot opt into this path. Each method preserves __call__ overrides.
+    if isinstance(callback, RateLimiter):
+        RateLimiter._on_response(callback, headers, method, non_upload)
+    elif isinstance(callback, SleepingRateLimitRule):
+        SleepingRateLimitRule._on_response(
+            callback, headers, method, non_upload
+        )
+    else:
+        callback(headers, method)
 
 
 class DefaultRateLimiter(RateLimiter):
